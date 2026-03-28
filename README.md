@@ -1,5 +1,7 @@
 ## Waggle detection + duration
 
+Git default branch: **`main`**.
+
 Pipeline learns **waggle vs background** (video windows) and **waggle run duration (seconds)** from `filtered_waggles_*.csv` (`duration` column = distance proxy) + `data/raw_videos/*.mp4`. **Bearing** is deferred to classical CV vs annotations.
 
 `.gitignore` excludes **`runs/`**, **checkpoints (`*.pt`)**, **`data/raw_videos/`**, and **video files** so the repo stays small on GitHub. Put MP4s locally; uncomment `data/annotations/` in `.gitignore` if CSVs must not be public.
