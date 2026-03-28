@@ -1,0 +1,43 @@
+# training artifacts
+runs/
+*.pt
+*.pth
+
+# video and large media
+data/raw_videos/
+# uncomment if annotations must stay off GitHub:
+# data/annotations/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# env / secrets
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# local inference outputs
+predicted_*.csv
+smoke_*.csv
