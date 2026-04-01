@@ -1,46 +1,41 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from waggle.video_dataset import max_valid_center, min_valid_center, probe_total_frames
+
 
 @dataclass(frozen=True)
-class Window:
+class Sample:
     video: str
-    start_frame: int
-    end_frame: int
+    center_frame: int
     is_waggle: int
     duration_s: float
 
 
-def _window_targets(events: pd.DataFrame, start_f: int, end_f: int) -> tuple[int, float]:
-    if events.empty:
-        return 0, 0.0
-
-    s = events["startFrame"].to_numpy(dtype=np.int64)
-    e = events["endFrame"].to_numpy(dtype=np.int64)
-    overlap = np.maximum(0, np.minimum(e, end_f) - np.maximum(s, start_f) + 1)
-    idx = int(np.argmax(overlap))
-    if int(overlap[idx]) == 0:
-        return 0, 0.0
-
-    dur = float(events.iloc[idx]["duration"])
-    return 1, dur
+def _in_any_segment(c: int, starts: np.ndarray, ends: np.ndarray) -> bool:
+    return bool(np.any((starts <= c) & (c <= ends)))
 
 
 def build_manifest(
     *,
     videos_dir: Path,
     csv_paths: list[Path],
-    window_seconds: float = 3.0,
     fps: int = 30,
+    clip_frames: int = 32,
+    decode_stride: int = 2,
+    center_stride_frames: int = 1,
+    neg_per_pos: int = 3,
+    seed: int = 0,
 ) -> pd.DataFrame:
-    window_frames = int(round(window_seconds * fps))
-    rows: list[Window] = []
+    center_stride_frames = max(1, int(center_stride_frames))
+    rng = np.random.default_rng(seed)
+    rows: list[Sample] = []
+    used: set[tuple[str, int]] = set()
 
     for csv_path in csv_paths:
         df = pd.read_csv(csv_path)
@@ -51,28 +46,51 @@ def build_manifest(
 
         stem = csv_path.name.replace("filtered_waggles_", "").replace(".csv", "")
         video_path = videos_dir / f"{stem}.mp4"
+        vid = str(video_path)
         if not video_path.exists():
             raise FileNotFoundError(f"Missing video for {csv_path.name}: {video_path}")
 
         max_end = int(df["endFrame"].max())
-        total_frames_est = max_end + 1
-        n_windows = int(math.ceil(total_frames_est / window_frames))
+        total_frames = max(max_end + 1, probe_total_frames(video_path, fps))
+        cmin = min_valid_center(clip_frames, decode_stride)
+        cmax = max_valid_center(total_frames, clip_frames, decode_stride)
+        if cmax < cmin:
+            continue
 
         events = df[["startFrame", "endFrame", "duration"]].copy()
+        s_arr = events["startFrame"].to_numpy(dtype=np.int64)
+        e_arr = events["endFrame"].to_numpy(dtype=np.int64)
 
-        for w in range(n_windows):
-            start_f = w * window_frames
-            end_f = start_f + window_frames - 1
-            is_waggle, dur = _window_targets(events, start_f, end_f)
-            rows.append(
-                Window(
-                    video=str(video_path),
-                    start_frame=int(start_f),
-                    end_frame=int(end_f),
-                    is_waggle=int(is_waggle),
-                    duration_s=float(dur),
-                )
-            )
+        for _, r in events.iterrows():
+            a = int(r["startFrame"])
+            b = int(r["endFrame"])
+            dur = float(r["duration"])
+            for c in range(a, b + 1, center_stride_frames):
+                if c < cmin or c > cmax:
+                    continue
+                k = (vid, c)
+                if k in used:
+                    continue
+                used.add(k)
+                rows.append(Sample(video=vid, center_frame=c, is_waggle=1, duration_s=dur))
+
+        n_pos = sum(1 for r in rows if r.video == vid and r.is_waggle == 1)
+        n_neg_target = max(1, int(neg_per_pos) * n_pos) if n_pos else max(1, int(neg_per_pos))
+        neg_added = 0
+        tries = 0
+        while neg_added < n_neg_target:
+            tries += 1
+            if tries > n_neg_target * 2000:
+                break
+            c = int(rng.integers(cmin, cmax + 1))
+            if _in_any_segment(c, s_arr, e_arr):
+                continue
+            k = (vid, c)
+            if k in used:
+                continue
+            used.add(k)
+            rows.append(Sample(video=vid, center_frame=c, is_waggle=0, duration_s=0.0))
+            neg_added += 1
 
     return pd.DataFrame([r.__dict__ for r in rows])
 

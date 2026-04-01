@@ -1,57 +1,37 @@
 ## Waggle detection + duration
 
-Git default branch: **`main`**.
+Center-frame clips → **waggle vs not** (BCE) + **duration** on positives (log-space L1). Inference slides centers; CSV columns are frame indices.
 
-Pipeline learns **waggle vs background** (video windows) and **waggle run duration (seconds)** from `filtered_waggles_*.csv` (`duration` column = distance proxy) + `data/raw_videos/*.mp4`. **Bearing** is deferred to classical CV vs annotations.
-
-`.gitignore` excludes **`runs/`**, **checkpoints (`*.pt`)**, **`data/raw_videos/`**, and **video files** so the repo stays small on GitHub. Put MP4s locally; uncomment `data/annotations/` in `.gitignore` if CSVs must not be public.
-
-### Setup with conda
+### Setup
 
 ```bash
-conda create -n waggle python=3.11 -y
-conda activate waggle
-
-conda install -c pytorch -c nvidia pytorch torchvision pytorch-cuda=12.1 -y
-pip install numpy pandas tqdm
+mamba env update -p /home/adameuba/.conda/envs/waggle_env -f environment.yml
 ```
 
-### Train on BYU HPC (GPU — use Slurm)
+Data: `data/annotations/filtered_waggles_*.csv`, `data/raw_videos/*.mp4`. `.gitignore` skips `runs/`, checkpoints, raw video.
 
-GPUs are only available inside **Slurm batch jobs** on compute nodes. Running `python train.py` on a login node will not give you a usable GPU (and may error with CUDA busy/unavailable).
+### Slurm (BYU RC / GPU nodes)
 
-From the repo root on the cluster:
+Use batch jobs for GPU work. From repo root:
 
 ```bash
-./run_with_logs.sh
-# same as: sbatch slurm_train_full.sbatch
-# then: tail -f runs/full/waggle-train-<JOBID>.out
+./run_with_logs.sh slurm_smoke.sbatch    # 1 GPU, 1 epoch + infer + overlay
+./run_with_logs.sh slurm_train.sbatch    # multi-GPU training
 ```
 
-Edit `slurm_train_full.sbatch` if you need a different GPU type, walltime, or `mamba run -p` path to your env.
+`Ctrl+C` only stops `tail`; cancel with `scancel <jobid>`. Override env: `ENV_PREFIX=/path/to/env sbatch ...`.
 
-**Training (`train.py`):** plain **BCE** (waggle vs not, `pos_weight` from class counts), **L1 in log-duration space** on waggle windows only, combined with `--duration_loss_weight`. **AdamW** + **cosine LR** to `lr/100`. Logs: `val_bce`, `val_dur_l1(log)`, `val_dur_mae_s` (seconds), `val_total`, P/R/F1, plus **`prob_mean`** / **`pos_rate`** (sanity vs all-0 or all-1 logits).
+**Decode once (repeat training):** After manifests exist under `runs/train/<jobid>/`, run `slurm_cache_clips.sbatch` with `SOURCE_RUN` set. Cached CSVs use column `clip_pt`. Train with `--no_build_manifest --train_manifest ..._cached.csv --val_manifest ..._cached.csv`. Fast scratch: node **`/tmp`** (not shared, not permanent); durable or multi-node: `CLIP_CACHE_ROOT` on shared storage.
 
-Outputs under `--out_dir` (Slurm default `runs/full/`): manifests, `best.pt` / `last.pt` (min `val_total`).
-
-### Train locally (CPU-only, slow / debug)
+### Local (CPU, slow)
 
 ```bash
 CUDA_VISIBLE_DEVICES= python train.py --data_dir data --out_dir runs/local --epochs 2 --batch_size 2
 ```
 
-### Infer
+### Infer & overlay
 
 ```bash
-python infer.py --video data/raw_videos/WaggleDance_36.mp4 --ckpt runs/full/best.pt --out_csv predicted_36.csv
+python infer.py --video data/raw_videos/WaggleDance_36.mp4 --ckpt runs/train/<jobid>/best.pt --out_csv predicted_36.csv --infer_stride_seconds 0.5
+python overlay.py --video data/raw_videos/WaggleDance_36.mp4 --segments_csv predicted_36.csv --out_video overlay.mp4
 ```
-
-CSV: `startFrame,endFrame,score,duration_s`.
-
-### Validate detection + duration vs annotations
-
-```bash
-python validate_segments.py --gt_csv data/annotations/filtered_waggles_WaggleDance_36.csv --pred_csv predicted_36.csv
-```
-
-Reports segment-level precision/recall/F1 (IoU match) and **duration MAE (s)** on matched segments.

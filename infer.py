@@ -8,30 +8,35 @@ import pandas as pd
 import torch
 
 from waggle.model import WaggleNet
-from waggle.video_dataset import _read_clip
+from waggle.video_dataset import max_valid_center, min_valid_center, probe_total_frames, read_clip_at_center
 
 
-def _to_segments(starts: np.ndarray, probs: np.ndarray, *, window_frames: int, thr_on: float, thr_off: float):
+def _to_segments(centers: np.ndarray, probs: np.ndarray, *, thr_on: float, thr_off: float):
     segs = []
     on = False
     cur_start = None
-    cur_scores = []
-    for s, p in zip(starts.tolist(), probs.tolist()):
+    prev_c = None
+    cur_scores: list[float] = []
+    for c, p in zip(centers.tolist(), probs.tolist()):
+        c = int(c)
+        p = float(p)
         if not on and p >= thr_on:
             on = True
-            cur_start = int(s)
-            cur_scores = [float(p)]
+            cur_start = c
+            prev_c = c
+            cur_scores = [p]
         elif on:
-            cur_scores.append(float(p))
             if p <= thr_off:
-                end = int(s + window_frames - 1)
-                segs.append((cur_start, end, float(np.mean(cur_scores))))
+                segs.append((cur_start, prev_c, float(np.mean(cur_scores))))
                 on = False
                 cur_start = None
+                prev_c = None
                 cur_scores = []
-    if on and cur_start is not None:
-        end = int(starts[-1] + window_frames - 1)
-        segs.append((cur_start, end, float(np.mean(cur_scores))))
+            else:
+                prev_c = c
+                cur_scores.append(p)
+    if on and cur_start is not None and prev_c is not None:
+        segs.append((cur_start, prev_c, float(np.mean(cur_scores))))
     return segs
 
 
@@ -41,7 +46,7 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--out_csv", type=Path, default=Path("predicted_waggles.csv"))
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--window_seconds", type=float, default=3.0)
+    ap.add_argument("--infer_stride_seconds", type=float, default=0.5)
     ap.add_argument("--clip_frames", type=int, default=32)
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--thr_on", type=float, default=0.6)
@@ -50,24 +55,26 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = WaggleNet(pretrained=False).to(device)
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
 
-    window_frames = int(round(args.window_seconds * args.fps))
+    total = probe_total_frames(args.video, args.fps)
+    cmin = min_valid_center(args.clip_frames, args.stride)
+    cmax = max_valid_center(total, args.clip_frames, args.stride)
+    step = max(1, int(round(args.infer_stride_seconds * args.fps)))
+
+    centers = []
+    probs = []
+    durs = []
     with torch.no_grad():
-        starts = []
-        probs = []
-        durs = []
-        w = 0
-        while True:
-            start_f = w * window_frames
+        for c in range(cmin, cmax + 1, step):
             try:
-                clip = _read_clip(
+                clip = read_clip_at_center(
                     video_path=str(args.video),
-                    start_frame=start_f,
+                    center_frame=c,
                     fps=args.fps,
-                    frames=args.clip_frames,
+                    clip_frames=args.clip_frames,
                     stride=args.stride,
                 )
             except Exception:
@@ -81,26 +88,23 @@ def main() -> None:
             p = float(torch.sigmoid(logit))
             dur_s = float(torch.expm1(torch.clamp(dlog, max=12.0)).cpu())
 
-            starts.append(start_f)
+            centers.append(c)
             probs.append(p)
             durs.append(dur_s)
-            w += 1
 
-    if not starts:
-        raise SystemExit(f"No windows decoded from {args.video}")
+    if not centers:
+        raise SystemExit(f"No clips decoded from {args.video}")
 
-    starts_a = np.asarray(starts, dtype=np.int64)
+    centers_a = np.asarray(centers, dtype=np.int64)
     probs_a = np.asarray(probs, dtype=np.float32)
     durs_a = np.asarray(durs, dtype=np.float32)
 
-    segs = _to_segments(starts_a, probs_a, window_frames=window_frames, thr_on=args.thr_on, thr_off=args.thr_off)
+    segs = _to_segments(centers_a, probs_a, thr_on=args.thr_on, thr_off=args.thr_off)
 
     out_rows = []
     for i, (sf, ef, score) in enumerate(segs):
-        mid = (sf + ef) // 2
-        nearest = int(np.argmin(np.abs(starts_a - mid)))
-        in_seg = (starts_a >= sf) & (starts_a <= ef)
-        dur_est = float(durs_a[in_seg].mean()) if in_seg.any() else float(durs_a[nearest])
+        in_seg = (centers_a >= sf) & (centers_a <= ef)
+        dur_est = float(durs_a[in_seg].mean()) if in_seg.any() else float(durs_a[np.argmin(np.abs(centers_a - (sf + ef) // 2))])
 
         out_rows.append(
             {
