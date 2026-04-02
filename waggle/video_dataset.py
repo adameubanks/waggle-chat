@@ -118,29 +118,25 @@ class WaggleWindowDataset(Dataset):
         self.clip_frames = int(clip_frames)
         self.stride = int(stride)
         self.resize_hw = tuple(resize_hw)
-        self._from_pt = "clip_pt" in self.df.columns
 
     def __len__(self) -> int:
         return int(len(self.df))
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[int(idx)]
-        if self._from_pt:
-            clip = torch.load(str(row["clip_pt"]), map_location="cpu", weights_only=False)
-        else:
-            clip = read_clip_at_center(
-                video_path=str(row["video"]),
-                center_frame=int(row["center_frame"]),
-                fps=self.fps,
-                clip_frames=self.clip_frames,
-                stride=self.stride,
-            )
-            clip = torch.nn.functional.interpolate(
-                clip,
-                size=self.resize_hw,
-                mode="bilinear",
-                align_corners=False,
-            )
+        clip = read_clip_at_center(
+            video_path=str(row["video"]),
+            center_frame=int(row["center_frame"]),
+            fps=self.fps,
+            clip_frames=self.clip_frames,
+            stride=self.stride,
+        )
+        clip = torch.nn.functional.interpolate(
+            clip,
+            size=self.resize_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
 
         y_cls = torch.tensor(float(row["is_waggle"]), dtype=torch.float32)
         y_dur = torch.tensor(float(row["duration_s"]), dtype=torch.float32)

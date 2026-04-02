@@ -41,3 +41,7 @@ env/
 # local inference outputs
 predicted_*.csv
 smoke_*.csv
+
+# core dumps (native crashes; often multi-GB)
+core
+core.*

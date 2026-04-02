@@ -118,7 +118,6 @@ def main() -> None:
         if not csv_paths:
             raise SystemExit(f"No filtered_waggles_*.csv in {annotations_dir}")
         if rank == 0:
-            print(f"building manifest ({len(csv_paths)} annotation files)...", flush=True)
             manifest = build_manifest(
                 videos_dir=videos_dir,
                 csv_paths=csv_paths,
@@ -131,8 +130,12 @@ def main() -> None:
             )
             if args.max_samples > 0 and len(manifest) > args.max_samples:
                 manifest = manifest.sample(n=args.max_samples, random_state=args.seed).reset_index(drop=True)
+                print(
+                    f"[manifest] subsampled to max_samples={args.max_samples} -> {len(manifest)} rows",
+                    flush=True,
+                )
             write_splits(manifest, out_dir=args.out_dir, train_frac=0.8, seed=args.seed)
-            print(f"wrote manifests: {len(manifest)} rows -> {args.out_dir}", flush=True)
+            print(f"[train] starting training; outputs -> {args.out_dir.resolve()}", flush=True)
         if is_dist:
             dist.barrier()
         train_csv = args.out_dir / "train_manifest.csv"

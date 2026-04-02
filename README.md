@@ -12,16 +12,31 @@ Data: `data/annotations/filtered_waggles_*.csv`, `data/raw_videos/*.mp4`. `.giti
 
 ### Slurm (BYU RC / GPU nodes)
 
-Use batch jobs for GPU work. From repo root:
+Batch script: **`train.sbatch`** (multi-GPU training, 30 epochs). From repo root:
 
 ```bash
-./run_with_logs.sh slurm_smoke.sbatch    # 1 GPU, 1 epoch + infer + overlay
-./run_with_logs.sh slurm_train.sbatch    # multi-GPU training
+./run_with_logs.sh train.sbatch
+# or: sbatch train.sbatch
 ```
 
-`Ctrl+C` only stops `tail`; cancel with `scancel <jobid>`. Override env: `ENV_PREFIX=/path/to/env sbatch ...`.
+**Where the logs are:** Slurm writes stdout/stderr under **`runs/train/`**, not the repo root. After you submit, note the job id (`squeue -u "$USER"` or the line printed by `sbatch --parsable`). Files look like:
 
-**Decode once (repeat training):** After manifests exist under `runs/train/<jobid>/`, run `slurm_cache_clips.sbatch` with `SOURCE_RUN` set. Cached CSVs use column `clip_pt`. Train with `--no_build_manifest --train_manifest ..._cached.csv --val_manifest ..._cached.csv`. Fast scratch: node **`/tmp`** (not shared, not permanent); durable or multi-node: `CLIP_CACHE_ROOT` on shared storage.
+- `runs/train/waggle-train-<jobid>.out`
+- `runs/train/waggle-train-<jobid>.err`
+
+(`waggle-train` comes from `#SBATCH --job-name` in `train.sbatch`.) That directory is **gitignored**, so you will not see those logs in `git status`; they are still on disk next to your clone.
+
+`Ctrl+C` only stops `tail` in `run_with_logs.sh`; the job keeps running until you `scancel <jobid>`. Override env: `ENV_PREFIX=/path/to/env sbatch train.sbatch`.
+
+**Quick local smoke (CPU, tiny):** see § Local below — useful before burning GPU hours.
+
+### If you see huge `core` / `core.*` files in the project root
+
+Those are **core dumps** (a C/C++/CUDA library or the Python interpreter crashed hard: segfault, bad CUDA state, OOM from the OS’s point of view, etc.). They are unrelated to normal Python tracebacks in the `.err` log.
+
+- Inspect the **`.err`** file for the same job time window.
+- Safe to delete: `rm -f core core.*`
+- To **stop creating** cores while debugging: `ulimit -c 0` (in your shell, or add `ulimit -c 0` near the top of `train.sbatch` after the shebang).
 
 ### Local (CPU, slow)
 

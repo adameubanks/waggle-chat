@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,7 +38,12 @@ def build_manifest(
     rows: list[Sample] = []
     used: set[tuple[str, int]] = set()
 
-    for csv_path in csv_paths:
+    n_csv = len(csv_paths)
+    t_all = time.perf_counter()
+    print(f"[manifest] building from {n_csv} annotation file(s), videos_dir={videos_dir.resolve()}", flush=True)
+
+    for i, csv_path in enumerate(csv_paths, start=1):
+        t_vid = time.perf_counter()
         df = pd.read_csv(csv_path)
         need = {"startFrame", "endFrame", "duration"}
         missing = need - set(df.columns)
@@ -50,11 +56,20 @@ def build_manifest(
         if not video_path.exists():
             raise FileNotFoundError(f"Missing video for {csv_path.name}: {video_path}")
 
+        print(f"[manifest] {i}/{n_csv} {video_path.name} (annotations {len(df)} events)", flush=True)
         max_end = int(df["endFrame"].max())
-        total_frames = max(max_end + 1, probe_total_frames(video_path, fps))
+        t0 = time.perf_counter()
+        probed = probe_total_frames(video_path, fps)
+        t_probe = time.perf_counter() - t0
+        total_frames = max(max_end + 1, probed)
+        print(
+            f"[manifest]   frame span: annotation max_end={max_end} probed_total={probed} -> using total_frames={total_frames} (probe {t_probe:.2f}s)",
+            flush=True,
+        )
         cmin = min_valid_center(clip_frames, decode_stride)
         cmax = max_valid_center(total_frames, clip_frames, decode_stride)
         if cmax < cmin:
+            print(f"[manifest]   skip: no valid center window (cmin={cmin} cmax={cmax})", flush=True)
             continue
 
         events = df[["startFrame", "endFrame", "duration"]].copy()
@@ -92,7 +107,18 @@ def build_manifest(
             rows.append(Sample(video=vid, center_frame=c, is_waggle=0, duration_s=0.0))
             neg_added += 1
 
-    return pd.DataFrame([r.__dict__ for r in rows])
+        print(
+            f"[manifest]   samples: pos={n_pos} neg={neg_added}/{n_neg_target} center in [{cmin},{cmax}] "
+            f"(video total {time.perf_counter() - t_vid:.2f}s, rows in manifest {len(rows)})",
+            flush=True,
+        )
+
+    out = pd.DataFrame([r.__dict__ for r in rows])
+    print(
+        f"[manifest] done: {len(out)} rows, {out['video'].nunique()} video(s), elapsed {time.perf_counter() - t_all:.2f}s",
+        flush=True,
+    )
+    return out
 
 
 def write_splits(
@@ -117,4 +143,9 @@ def write_splits(
     val_path = out_dir / "val_manifest.csv"
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path, index=False)
+    print(
+        f"[manifest] split -> {train_path.name}: {len(train_df)} rows, {train_df['video'].nunique()} videos | "
+        f"{val_path.name}: {len(val_df)} rows, {val_df['video'].nunique()} videos",
+        flush=True,
+    )
     return train_path, val_path
