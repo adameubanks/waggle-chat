@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=waggle-train
-#SBATCH --time=2-00:00:00
+#SBATCH --time=05:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120G
-#SBATCH --gpus=4
+#SBATCH --gpus=1
 #SBATCH --output=runs/train/%x-%j.out
 #SBATCH --error=runs/train/%x-%j.err
 
@@ -20,6 +20,7 @@ cd /nobackup/archive/usr/adameuba/waggle_chat
 mkdir -p runs/train
 
 ENV_PREFIX="${ENV_PREFIX:-/home/adameuba/.conda/envs/waggle_env}"
+MANIFEST_DIR="${MANIFEST_DIR:-runs/train/11165731}"
 OUTDIR="runs/train/${SLURM_JOB_ID:-local}"
 mkdir -p "$OUTDIR"
 
@@ -35,12 +36,16 @@ echo "node=$(hostname)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "NPROC=$NPROC"
 echo "ENV_PREFIX=$ENV_PREFIX"
+echo "MANIFEST_DIR=$MANIFEST_DIR"
 echo "OUTDIR=$OUTDIR"
 echo
 
 mamba run -p "$ENV_PREFIX" torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC" train.py \
   --data_dir data \
   --out_dir "$OUTDIR" \
+  --no_build_manifest \
+  --train_manifest "$MANIFEST_DIR/train_manifest.csv" \
+  --val_manifest "$MANIFEST_DIR/val_manifest.csv" \
   --epochs 30 \
   --batch_size 8 \
   --lr 1e-4 \
@@ -54,4 +59,5 @@ mamba run -p "$ENV_PREFIX" torchrun --standalone --nnodes=1 --nproc_per_node="$N
   --seed 0 \
   --num_workers 4
 
-ls -lh "$OUTDIR"/*.pt "$OUTDIR"/*manifest.csv 2>/dev/null || true
+ls -lh "$OUTDIR"/*.pt 2>/dev/null || true
+ls -lh "$MANIFEST_DIR"/*manifest.csv 2>/dev/null || true

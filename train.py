@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 import warnings
 from pathlib import Path
 
@@ -94,6 +95,8 @@ def main() -> None:
     ap.add_argument("--val_manifest", type=Path, default=None)
     ap.add_argument("--no_build_manifest", action="store_true")
     args = ap.parse_args()
+    args.out_dir = args.out_dir.expanduser().resolve()
+    args.data_dir = args.data_dir.expanduser().resolve()
 
     is_dist, rank, local_rank, world_size = _setup_dist()
     if is_dist:
@@ -109,14 +112,19 @@ def main() -> None:
     if args.no_build_manifest:
         if args.train_manifest is None or args.val_manifest is None:
             raise SystemExit("--no_build_manifest requires --train_manifest and --val_manifest")
-        train_csv = args.train_manifest
-        val_csv = args.val_manifest
+        train_csv = args.train_manifest.expanduser().resolve()
+        val_csv = args.val_manifest.expanduser().resolve()
     else:
         annotations_dir = args.data_dir / "annotations"
         videos_dir = args.data_dir / "raw_videos"
         csv_paths = sorted(annotations_dir.glob("filtered_waggles_*.csv"))
         if not csv_paths:
             raise SystemExit(f"No filtered_waggles_*.csv in {annotations_dir}")
+        ready = args.out_dir / ".manifest_ready"
+        if rank == 0:
+            ready.unlink(missing_ok=True)
+        if is_dist:
+            dist.barrier()
         if rank == 0:
             manifest = build_manifest(
                 videos_dir=videos_dir,
@@ -135,7 +143,11 @@ def main() -> None:
                     flush=True,
                 )
             write_splits(manifest, out_dir=args.out_dir, train_frac=0.8, seed=args.seed)
-            print(f"[train] starting training; outputs -> {args.out_dir.resolve()}", flush=True)
+            ready.touch()
+            print(f"[train] starting training; outputs -> {args.out_dir}", flush=True)
+        elif is_dist:
+            while not ready.exists():
+                time.sleep(0.25)
         if is_dist:
             dist.barrier()
         train_csv = args.out_dir / "train_manifest.csv"
@@ -208,6 +220,11 @@ def main() -> None:
 
         sched.step()
         lr_now = float(opt.param_groups[0]["lr"])
+
+        if is_dist:
+            dist.barrier()
+        val_done = args.out_dir / f".val_done_{epoch}"
+        val_done.unlink(missing_ok=True)
 
         v_cls = v_dur_l1 = v_dur_mae = 0.0
         v_n = vd_n = 0
@@ -284,9 +301,15 @@ def main() -> None:
                 f"P/R/F1={prec:.3f}/{rec:.3f}/{f1:.3f} acc={acc:.3f} AP={ap:.3f} thr={args.cls_threshold} | "
                 f"prob_mean={prob_mean:.3f} pos_rate={pos_rate:.3f}"
             )
+            val_done.touch()
+        elif is_dist:
+            while not val_done.exists():
+                time.sleep(0.25)
 
         if is_dist:
             dist.barrier()
+        if rank == 0:
+            val_done.unlink(missing_ok=True)
 
     if is_dist:
         dist.destroy_process_group()
