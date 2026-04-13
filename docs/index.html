@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Waggle → Map Demo</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <div class="mark">waggle</div>
+        <div class="title">video → events → vector → map</div>
+      </div>
+      <div class="controls">
+        <label>
+          Clip
+          <select id="clipSelect"></select>
+        </label>
+        <label>
+          Distance scale
+          <input id="scale" type="range" min="50" max="800" step="10" value="300" />
+          <span id="scaleVal"></span>
+        </label>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="panel">
+        <div class="panelTitle">Input</div>
+        <video id="video" controls playsinline></video>
+        <div class="hint">
+          Click a segment below to jump. Hover for details.
+        </div>
+        <div id="timeline" class="timeline" aria-label="Waggle timeline"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panelTitle">Decoded “where to go”</div>
+        <canvas id="map" width="680" height="520"></canvas>
+        <div id="eventMeta" class="meta"></div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <div>
+        Static demo: precomputed inference JSON. No server.
+      </div>
+      <div class="muted">
+        Orientation is estimated from motion energy; calibrations are illustrative.
+      </div>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
+

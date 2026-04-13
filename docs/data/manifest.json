@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "clips": [
+    {
+      "id": "waggle38",
+      "title": "WaggleDance_38 (best.pt)",
+      "videoUrl": "data/clips/waggle38.mp4",
+      "resultUrl": "data/runs/waggle38.json"
+    }
+  ]
+}

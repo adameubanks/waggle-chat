@@ -50,3 +50,19 @@ CUDA_VISIBLE_DEVICES= python train.py --data_dir data --out_dir runs/local --epo
 python infer.py --video data/raw_videos/WaggleDance_36.mp4 --ckpt runs/train/<jobid>/best.pt --out_csv predicted_36.csv --infer_stride_seconds 0.5
 python overlay.py --video data/raw_videos/WaggleDance_36.mp4 --segments_csv predicted_36.csv --out_video overlay.mp4
 ```
+
+### Export a GitHub Pages demo
+
+This writes `docs/data/manifest.json` plus `docs/data/runs/<clip_id>.json` (events + decoded vector). Optionally copies the video into `docs/data/clips/`.
+
+```bash
+python export_demo.py \
+  --video data/raw_videos/WaggleDance_38.mp4 \
+  --ckpt runs/train/<jobid>/best.pt \
+  --out_dir docs \
+  --clip_id waggle38 \
+  --title "WaggleDance_38" \
+  --copy_video
+```
+
+Then open `docs/index.html` (or serve `docs/` via GitHub Pages).

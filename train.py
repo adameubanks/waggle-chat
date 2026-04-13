@@ -62,6 +62,24 @@ def _average_precision(probs: np.ndarray, y: np.ndarray) -> float:
     return float(ap)
 
 
+def _best_f1(probs: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    yb = (y > 0.5).astype(np.int64)
+    npos = int(yb.sum())
+    if npos == 0 or probs.size == 0:
+        return 0.0, 0.5
+    order = np.argsort(-probs)
+    p_sorted = probs[order]
+    y_sorted = yb[order]
+    tp = np.cumsum(y_sorted == 1)
+    fp = np.cumsum(y_sorted == 0)
+    prec = tp / np.maximum(1, tp + fp)
+    rec = tp / npos
+    f1 = (2 * prec * rec) / np.maximum(1e-12, prec + rec)
+    idx = int(np.argmax(f1))
+    thr = float(p_sorted[idx])
+    return float(f1[idx]), thr
+
+
 def _setup_dist() -> tuple[bool, int, int, int]:
     ws = int(os.environ.get("WORLD_SIZE", "1"))
     if ws <= 1:
@@ -69,7 +87,7 @@ def _setup_dist() -> tuple[bool, int, int, int]:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
     return True, rank, local_rank, ws
 
 
@@ -89,7 +107,13 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--neg_per_pos", type=int, default=3)
     ap.add_argument("--cls_threshold", type=float, default=0.5)
-    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--select_metric", type=str, default="best_f1", choices=["best_f1", "val_total"])
+    ap.add_argument("--num_workers", type=int, default=8)
+    ap.add_argument("--prefetch_factor", type=int, default=4)
+    ap.add_argument("--val_num_workers", type=int, default=0)
+    ap.add_argument("--val_prefetch_factor", type=int, default=2)
+    ap.add_argument("--val_every", type=int, default=1)
+    ap.add_argument("--val_max_batches", type=int, default=0)
     ap.add_argument("--max_samples", type=int, default=0)
     ap.add_argument("--train_manifest", type=Path, default=None)
     ap.add_argument("--val_manifest", type=Path, default=None)
@@ -156,26 +180,35 @@ def main() -> None:
     train_ds = WaggleWindowDataset(train_csv, fps=args.fps, clip_frames=args.clip_frames, stride=args.stride)
     val_ds = WaggleWindowDataset(val_csv, fps=args.fps, clip_frames=args.clip_frames, stride=args.stride)
 
+    train_nw = args.num_workers
+    train_dl_common = {"num_workers": train_nw, "pin_memory": True, "persistent_workers": train_nw > 0}
+    if train_nw > 0:
+        train_dl_common["prefetch_factor"] = args.prefetch_factor
+    val_nw = args.val_num_workers
+    val_dl_common = {"num_workers": val_nw, "pin_memory": True, "persistent_workers": False}
+    if val_nw > 0:
+        val_dl_common["prefetch_factor"] = args.val_prefetch_factor
     train_sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if is_dist else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if is_dist else None
     train_dl = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=train_sampler is None,
         sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        **train_dl_common,
     )
     val_dl = DataLoader(
         val_ds,
         batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        shuffle=val_sampler is None,
+        sampler=val_sampler,
+        **val_dl_common,
     )
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
     model = WaggleNet(pretrained=True).to(device)
     if is_dist:
         model = DDP(model, device_ids=[local_rank])
@@ -187,10 +220,12 @@ def main() -> None:
     pos_w = torch.tensor([compute_pos_weight(train_csv)], device=device, dtype=torch.float32)
     val_pos_w = torch.tensor([compute_pos_weight(val_csv)], device=device, dtype=torch.float32)
 
-    best_val = float("inf")
+    best_score: float | None = None
     for epoch in range(1, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
         model.train()
         pbar = tqdm(train_dl, desc=f"train {epoch}", leave=False, disable=rank != 0)
         for clip, y_cls, y_dur in pbar:
@@ -198,22 +233,27 @@ def main() -> None:
             y_cls = y_cls.to(device, non_blocking=True)
             y_dur = y_dur.to(device, non_blocking=True)
 
-            out = model(clip)
-            logit = out[:, 0]
-            pred_log = out[:, 1]
-            tgt_log = _log1p(y_dur)
-            wmask = y_cls > 0.5
-
-            loss_cls = F.binary_cross_entropy_with_logits(logit, y_cls, pos_weight=pos_w)
-            if wmask.any():
-                loss_dur = F.l1_loss(pred_log[wmask], tgt_log[wmask])
-            else:
-                loss_dur = torch.tensor(0.0, device=device)
-            loss = loss_cls + args.duration_loss_weight * loss_dur
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                out = model(clip)
+                logit = out[:, 0]
+                pred_log = out[:, 1]
+                tgt_log = _log1p(y_dur)
+                wmask = y_cls > 0.5
+                loss_cls = F.binary_cross_entropy_with_logits(logit, y_cls, pos_weight=pos_w)
+                if wmask.any():
+                    loss_dur = F.l1_loss(pred_log[wmask], tgt_log[wmask])
+                else:
+                    loss_dur = torch.tensor(0.0, device=device)
+                loss = loss_cls + args.duration_loss_weight * loss_dur
 
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
 
             if rank == 0:
                 pbar.set_postfix(bce=float(loss_cls.detach()), dur=float(loss_dur.detach()))
@@ -223,53 +263,106 @@ def main() -> None:
 
         if is_dist:
             dist.barrier()
-        val_done = args.out_dir / f".val_done_{epoch}"
-        val_done.unlink(missing_ok=True)
 
-        v_cls = v_dur_l1 = v_dur_mae = 0.0
+        do_val = args.val_every > 0 and (epoch % args.val_every == 0)
+        if not do_val:
+            if rank == 0:
+                print(f"epoch={epoch}/{args.epochs} lr={lr_now:.2e} | val=skipped (val_every={args.val_every})", flush=True)
+            if is_dist:
+                dist.barrier()
+            continue
+
+        model.eval()
+        v_cls_sum = v_dur_l1_sum = v_mae_sum = 0.0
         v_n = vd_n = 0
-        v_mae_sum = 0.0
-        logits_all: list[torch.Tensor] = []
-        y_all: list[torch.Tensor] = []
+        logits_local: list[np.ndarray] = []
+        y_local: list[np.ndarray] = []
+        dur_err_local: list[np.ndarray] = []
+        with torch.no_grad():
+            for i, (clip, y_cls, y_dur) in enumerate(
+                tqdm(val_dl, desc=f"val {epoch}", leave=False, disable=rank != 0)
+            ):
+                if args.val_max_batches > 0 and i >= args.val_max_batches:
+                    break
+                clip = clip.to(device, non_blocking=True)
+                y_cls = y_cls.to(device, non_blocking=True)
+                y_dur = y_dur.to(device, non_blocking=True)
+
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    out = model(clip)
+                logit = out[:, 0].float()
+                pred_log = out[:, 1].float()
+                tgt_log = _log1p(y_dur)
+                bs = int(len(clip))
+
+                v_cls_sum += float(F.binary_cross_entropy_with_logits(logit, y_cls, pos_weight=val_pos_w)) * bs
+                v_n += bs
+                wmask = y_cls > 0.5
+                if wmask.any():
+                    v_dur_l1_sum += float(F.l1_loss(pred_log[wmask], tgt_log[wmask], reduction="sum"))
+                    pred_s = torch.expm1(torch.clamp(pred_log, max=12.0))
+                    derr = (pred_s[wmask] - y_dur[wmask]).abs().detach().cpu().numpy()
+                    v_mae_sum += float(derr.sum())
+                    vd_n += int(wmask.sum())
+                    dur_err_local.append(derr)
+
+                logits_local.append(logit.detach().cpu().numpy())
+                y_local.append(y_cls.detach().cpu().numpy())
+
+        if is_dist:
+            sums = torch.tensor(
+                [v_cls_sum, v_dur_l1_sum, v_mae_sum, float(v_n), float(vd_n)],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+            v_cls_sum, v_dur_l1_sum, v_mae_sum, v_n_f, vd_n_f = sums.tolist()
+            v_n = int(v_n_f)
+            vd_n = int(vd_n_f)
+
+        v_cls = v_cls_sum / max(1, v_n)
+        v_dur_l1 = v_dur_l1_sum / max(1, vd_n)
+        v_dur_mae = v_mae_sum / max(1, vd_n)
+        v_dur_med = 0.0
+        val_total = v_cls + args.duration_loss_weight * v_dur_l1
+
+        ap = prec = rec = f1 = acc = prob_mean = pos_rate = 0.0
+        best_f1 = best_thr = 0.0
+        if is_dist:
+            payload = (
+                np.concatenate(logits_local) if logits_local else np.zeros((0,), dtype=np.float32),
+                np.concatenate(y_local) if y_local else np.zeros((0,), dtype=np.float32),
+            )
+            gathered: list[tuple[np.ndarray, np.ndarray] | None] | None = [None] * world_size if rank == 0 else None
+            dist.gather_object(payload, object_gather_list=gathered, dst=0)
+            d_payload = np.concatenate(dur_err_local) if dur_err_local else np.zeros((0,), dtype=np.float32)
+            d_gathered: list[np.ndarray | None] | None = [None] * world_size if rank == 0 else None
+            dist.gather_object(d_payload, object_gather_list=d_gathered, dst=0)
+            if rank == 0:
+                got = [g for g in (gathered or []) if g is not None]
+                logits_cat = np.concatenate([g[0] for g in got]) if got else np.zeros((0,), dtype=np.float32)
+                y_cat = np.concatenate([g[1] for g in got]) if got else np.zeros((0,), dtype=np.float32)
+                probs = 1.0 / (1.0 + np.exp(-logits_cat))
+                prec, rec, f1, acc = _cls_metrics(probs, y_cat, float(args.cls_threshold))
+                best_f1, best_thr = _best_f1(probs, y_cat)
+                ap = _average_precision(probs, y_cat)
+                prob_mean = float(probs.mean()) if probs.size else 0.0
+                pos_rate = float((y_cat > 0.5).mean()) if y_cat.size else 0.0
+                derr_all = np.concatenate([d for d in (d_gathered or []) if d is not None])
+                v_dur_med = float(np.median(derr_all)) if derr_all.size else 0.0
+        else:
+            logits_cat = np.concatenate(logits_local) if logits_local else np.zeros((0,), dtype=np.float32)
+            y_cat = np.concatenate(y_local) if y_local else np.zeros((0,), dtype=np.float32)
+            probs = 1.0 / (1.0 + np.exp(-logits_cat))
+            prec, rec, f1, acc = _cls_metrics(probs, y_cat, float(args.cls_threshold))
+            best_f1, best_thr = _best_f1(probs, y_cat)
+            ap = _average_precision(probs, y_cat)
+            prob_mean = float(probs.mean()) if probs.size else 0.0
+            pos_rate = float((y_cat > 0.5).mean()) if y_cat.size else 0.0
+            derr_all = np.concatenate(dur_err_local) if dur_err_local else np.zeros((0,), dtype=np.float32)
+            v_dur_med = float(np.median(derr_all)) if derr_all.size else 0.0
 
         if rank == 0:
-            model.eval()
-            with torch.no_grad():
-                for clip, y_cls, y_dur in tqdm(val_dl, desc=f"val {epoch}", leave=False):
-                    clip = clip.to(device, non_blocking=True)
-                    y_cls = y_cls.to(device, non_blocking=True)
-                    y_dur = y_dur.to(device, non_blocking=True)
-
-                    out = model(clip)
-                    logit = out[:, 0]
-                    pred_log = out[:, 1]
-                    tgt_log = _log1p(y_dur)
-                    bs = int(len(clip))
-
-                    v_cls += float(F.binary_cross_entropy_with_logits(logit, y_cls, pos_weight=val_pos_w)) * bs
-                    v_n += bs
-                    wmask = y_cls > 0.5
-                    if wmask.any():
-                        v_dur_l1 += float(F.l1_loss(pred_log[wmask], tgt_log[wmask], reduction="sum"))
-                        pred_s = torch.expm1(torch.clamp(pred_log, max=12.0))
-                        v_mae_sum += float((pred_s[wmask] - y_dur[wmask]).abs().sum().cpu())
-                        vd_n += int(wmask.sum())
-                    logits_all.append(logit.float().cpu())
-                    y_all.append(y_cls.float().cpu())
-
-            v_cls /= max(1, v_n)
-            v_dur_l1 /= max(1, vd_n)
-            v_dur_mae = v_mae_sum / max(1, vd_n)
-            val_total = v_cls + args.duration_loss_weight * v_dur_l1
-
-            logits_cat = torch.cat(logits_all)
-            y_cat = torch.cat(y_all)
-            probs = torch.sigmoid(logits_cat).numpy()
-            prec, rec, f1, acc = _cls_metrics(probs, y_cat.numpy(), float(args.cls_threshold))
-            ap = _average_precision(probs, y_cat.numpy())
-            prob_mean = float(probs.mean())
-            pos_rate = float((y_cat > 0.5).float().mean())
-
             args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
             ckpt = {
                 "epoch": epoch,
@@ -281,35 +374,34 @@ def main() -> None:
                 "val_bce": v_cls,
                 "val_dur_l1_log": v_dur_l1,
                 "val_dur_mae_s": v_dur_mae,
+                "val_dur_med_ae_s": v_dur_med,
                 "val_dur_n": vd_n,
                 "val_precision": prec,
                 "val_recall": rec,
                 "val_f1": f1,
+                "val_best_f1": best_f1,
+                "val_best_f1_thr": best_thr,
                 "val_accuracy": acc,
                 "val_ap": ap,
                 "lr": lr_now,
             }
             torch.save(ckpt, args.out_dir / "last.pt")
-            if val_total < best_val:
-                best_val = val_total
+            score = best_f1 if args.select_metric == "best_f1" else -val_total
+            if best_score is None or score > best_score:
+                best_score = score
                 torch.save(ckpt, args.out_dir / "best.pt")
-
             print(
                 f"epoch={epoch}/{args.epochs} lr={lr_now:.2e} | "
-                f"val_bce={v_cls:.5f} val_dur_l1(log)={v_dur_l1:.5f} val_dur_mae_s={v_dur_mae:.4f} n_dur={vd_n} | "
+                f"val_bce={v_cls:.5f} val_dur_l1(log)={v_dur_l1:.5f} val_dur_mae_s={v_dur_mae:.4f} "
+                f"val_dur_med_ae_s={v_dur_med:.4f} n_dur={vd_n} | "
                 f"val_total={val_total:.5f} | "
-                f"P/R/F1={prec:.3f}/{rec:.3f}/{f1:.3f} acc={acc:.3f} AP={ap:.3f} thr={args.cls_threshold} | "
+                f"P/R/F1={prec:.3f}/{rec:.3f}/{f1:.3f} bestF1={best_f1:.3f}@{best_thr:.3f} "
+                f"acc={acc:.3f} AP={ap:.3f} thr={args.cls_threshold} | "
                 f"prob_mean={prob_mean:.3f} pos_rate={pos_rate:.3f}"
             )
-            val_done.touch()
-        elif is_dist:
-            while not val_done.exists():
-                time.sleep(0.25)
 
         if is_dist:
             dist.barrier()
-        if rank == 0:
-            val_done.unlink(missing_ok=True)
 
     if is_dist:
         dist.destroy_process_group()
