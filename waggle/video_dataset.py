@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import warnings
 from pathlib import Path
 
@@ -9,10 +8,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-warnings.filterwarnings("ignore", category=UserWarning, module=r"torchvision\.io\._video_deprecation_warning")
-warnings.filterwarnings("ignore", category=UserWarning, module=r"torchvision\.io\.video_reader")
-
-from torchvision.io import VideoReader
+warnings.filterwarnings("ignore", category=UserWarning, module=r"torchvision\..*")
 
 
 def middle_tensor_index(clip_frames: int) -> int:
@@ -34,19 +30,19 @@ def max_valid_center(total_frames: int, clip_frames: int, stride: int) -> int:
 
 
 def probe_total_frames(video_path: Path, fps: int) -> int:
-    vr = VideoReader(str(video_path), "video")
-    md = vr.get_metadata()
-    dur_s = None
     try:
-        dur_s = float(md["video"]["duration"][0])
-    except Exception:
-        dur_s = None
-    if dur_s is not None and math.isfinite(dur_s) and dur_s > 0:
-        return max(1, int(round(dur_s * fps)))
-    n = 0
-    for _ in vr:
-        n += 1
-    return max(1, n)
+        import cv2  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"video IO requires opencv-python (cv2). Import failed: {e}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video {video_path}")
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    cap.release()
+    if n > 0:
+        return n
+    return 1
 
 
 def _read_clip(
@@ -57,32 +53,39 @@ def _read_clip(
     frames: int,
     stride: int,
 ) -> torch.Tensor:
-    vr = VideoReader(video_path, "video")
-    vr.set_current_stream("video")
-    vr.seek(start_frame / fps)
+    try:
+        import cv2  # type: ignore
+    except Exception as e:
+        raise SystemExit(f"video IO requires opencv-python (cv2). Import failed: {e}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video {video_path}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_frame))
 
     out: list[torch.Tensor] = []
-    need = frames
-    step = stride
+    need = int(frames)
+    step = max(1, int(stride))
     i = 0
-    for frame in vr:
+    while need > 0:
+        ok, frame = cap.read()
+        if not ok:
+            break
         if i % step == 0:
-            out.append(frame["data"])
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            out.append(torch.from_numpy(frame))
             need -= 1
-            if need == 0:
-                break
         i += 1
+    cap.release()
 
     if not out:
         raise RuntimeError(f"Failed to decode clip from {video_path} @ frame {start_frame}")
 
-    clip = torch.stack(out, dim=0)
+    clip = torch.stack(out, dim=0)  # T,H,W,C uint8
     if clip.shape[0] < frames:
         pad = clip[-1:].repeat(frames - clip.shape[0], 1, 1, 1)
         clip = torch.cat([clip, pad], dim=0)
-
-    clip = clip.to(torch.float32) / 255.0
-    return clip
+    return clip.to(torch.float32) / 255.0
 
 
 def read_clip_at_center(

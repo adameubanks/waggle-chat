@@ -43,7 +43,7 @@ def build_cache(
 
     meta = CacheMeta(clip_frames=int(clip_frames), stride=int(stride), resize_hw=tuple(resize_hw))
     meta_path = out_dir / "meta.npz"
-    np.savez_compressed(meta_path, clip_frames=meta.clip_frames, stride=meta.stride, h=meta.resize_hw[0], w=meta.resize_hw[1])
+    np.savez(meta_path, clip_frames=meta.clip_frames, stride=meta.stride, h=meta.resize_hw[0], w=meta.resize_hw[1])
 
     shards_dir = out_dir / "shards"
     shards_dir.mkdir(parents=True, exist_ok=True)
@@ -58,13 +58,15 @@ def build_cache(
         nonlocal shard_id, cur_centers, cur_labels, cur_g
         if not cur_centers:
             return
-        shard_path = shards_dir / f"shard_{shard_id:05d}.npz"
+        shard = f"shard_{shard_id:05d}"
         g = np.stack(cur_g, axis=0).astype(np.uint8)  # N,T,H,W
         centers = np.asarray(cur_centers, dtype=np.int64)
         labels = np.asarray(cur_labels, dtype=np.float32)
-        np.savez_compressed(shard_path, centers=centers, labels=labels, g=g)
+        np.save(shards_dir / f"{shard}_g.npy", g, allow_pickle=False)
+        np.save(shards_dir / f"{shard}_centers.npy", centers, allow_pickle=False)
+        np.save(shards_dir / f"{shard}_labels.npy", labels, allow_pickle=False)
         for i in range(len(cur_centers)):
-            index_rows.append({"shard": shard_path.name, "offset": i})
+            index_rows.append({"shard": shard, "offset": i})
         shard_id += 1
         cur_centers = []
         cur_labels = []

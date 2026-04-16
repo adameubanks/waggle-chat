@@ -70,6 +70,8 @@ class CachedBinaryWaggleDataset(Dataset):
         self.h = int(meta["h"])
         self.w = int(meta["w"])
         self._shard_cache: dict[str, dict[str, np.ndarray]] = {}
+        for p in sorted((self.cache_dir / "shards").glob("*_g.npy")):
+            self._load_shard(p.name[: -len("_g.npy")])
 
     def __len__(self) -> int:
         return int(len(self.df))
@@ -78,11 +80,11 @@ class CachedBinaryWaggleDataset(Dataset):
         got = self._shard_cache.get(name)
         if got is not None:
             return got
-        path = self.cache_dir / "shards" / name
-        z = np.load(path)
-        data = {"g": z["g"], "labels": z["labels"], "centers": z["centers"]}
-        if len(self._shard_cache) > 2:
-            self._shard_cache.clear()
+        shards = self.cache_dir / "shards"
+        g = np.load(shards / f"{name}_g.npy")
+        labels = np.load(shards / f"{name}_labels.npy")
+        centers = np.load(shards / f"{name}_centers.npy")
+        data = {"g": g, "labels": labels, "centers": centers}
         self._shard_cache[name] = data
         return data
 
