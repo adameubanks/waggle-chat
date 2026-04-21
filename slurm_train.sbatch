@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=waggle-train
-#SBATCH --time=20:00:00
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=256G
 #SBATCH --gpus=1
 #SBATCH --output=runs/slurm/%x-%j.out
 #SBATCH --error=runs/slurm/%x-%j.err
@@ -26,7 +26,8 @@ CACHE_DIR="${RUN_DIR}/cache"
 LOCAL_TMP="/tmp/${SLURM_JOB_ID:-local}"
 mkdir -p "$RUN_DIR" "$MAN_DIR"
 
-echo "job=${SLURM_JOB_ID:-?} node=$(hostname) cuda=${CUDA_VISIBLE_DEVICES:-unset}"
+NPROC="${NPROC:-4}"
+echo "job=${SLURM_JOB_ID:-?} node=$(hostname) cuda=${CUDA_VISIBLE_DEVICES:-unset} nproc=${NPROC}"
 echo "ENV_PREFIX=$ENV_PREFIX"
 echo "RUN_DIR=$RUN_DIR"
 
@@ -69,7 +70,7 @@ rsync -a --info=progress2 "$CACHE_DIR/" "$LOCAL_TMP/cache/"
 LOCAL_CACHE="$LOCAL_TMP/cache"
 ls -lah "$LOCAL_CACHE/train/shards" | head -n 5 || true
 
-mamba run -p "$ENV_PREFIX" python run.py train \
+mamba run -p "$ENV_PREFIX" torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" run.py train \
   --train_manifest "$MAN_DIR/train_manifest.csv" \
   --val_manifest "$MAN_DIR/val_manifest.csv" \
   --out_dir "$RUN_DIR" \
@@ -79,8 +80,8 @@ mamba run -p "$ENV_PREFIX" python run.py train \
   --batch_size 64 \
   --lr 3e-4 \
   --weight_decay 5e-3 \
-  --num_workers 1 \
-  --prefetch_factor 1 \
+  --num_workers 3 \
+  --prefetch_factor 2 \
   --val_every 1 \
   --val_max_batches 20 \
   --amp
